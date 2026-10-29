@@ -42,6 +42,26 @@ fuse.fuse_python_api = (0, 2)
 ROOT_DRIVEWSID = "FOLDER::com.apple.CloudDocs::root"
 DIRECTORY_NODE_TYPES = {"folder", "app_library"}
 IO_CHUNK_SIZE = 1024 * 1024
+# (connect, read) seconds.  pyicloud sends requests with timeout=None, so a
+# stalled connection (e.g. after suspend) would otherwise block forever.  The
+# read timeout bounds each socket read, not a whole transfer, so streamed
+# downloads and large uploads are unaffected.
+ICLOUD_REQUEST_TIMEOUT = (15, 120)
+
+
+def apply_default_timeout(session, timeout=ICLOUD_REQUEST_TIMEOUT):
+    """Make *session* use *timeout* for any request that does not set one."""
+    for name in ("request", "request_raw"):
+        original = getattr(session, name, None)
+        if original is None:
+            continue
+
+        def wrapped(method, url, *args, _original=original, **kwargs):
+            if kwargs.get("timeout") is None:
+                kwargs["timeout"] = timeout
+            return _original(method, url, *args, **kwargs)
+
+        setattr(session, name, wrapped)
 
 
 def normalize_icloud_path(path):
@@ -641,13 +661,25 @@ class LocalMirror:
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
 
-    def write_atomic_stream(self, path, source, mtime=None, chunk_size=IO_CHUNK_SIZE):
+    def write_atomic_stream(self, path, source, mtime=None, chunk_size=IO_CHUNK_SIZE, should_abort=None):
+        """Stream *source* into *path* atomically.
+
+        *should_abort* is checked between chunks; when it returns True the
+        partial download is discarded and InterruptedError is raised, so a
+        multi-GB hydrate does not hold up service shutdown.
+        """
         self.ensure_parent(path)
         local = self.local_path(path)
         fd, tmp_path = tempfile.mkstemp(dir=self.tmp_dir)
         try:
             with os.fdopen(fd, "wb") as handle:
-                shutil.copyfileobj(source, handle, length=chunk_size)
+                while True:
+                    if should_abort is not None and should_abort():
+                        raise InterruptedError(f"download of {path} aborted")
+                    chunk = source.read(chunk_size)
+                    if not chunk:
+                        break
+                    handle.write(chunk)
             os.replace(tmp_path, local)
             if mtime is not None:
                 os.utime(local, (mtime, mtime))
@@ -755,6 +787,7 @@ class ICloudSyncEngine:
         self.exclude_paths = normalize_icloud_paths(exclude_paths)
         self.executor = ThreadPoolExecutor(max_workers=self.warmup_workers, thread_name_prefix="warmup")
         self.stop_event = threading.Event()
+        self.last_crawl_skipped_paths = []
         self.refresh_now_event = threading.Event()
         self.path_locks = {}
         self.path_locks_lock = threading.Lock()
@@ -835,7 +868,11 @@ class ICloudSyncEngine:
     def initial_scan(self):
         crawl_started_at = int(time.time())
         snapshot = self._crawl_remote_snapshot()
-        self._apply_remote_snapshot(snapshot, crawl_started_at=crawl_started_at)
+        self._apply_remote_snapshot(
+            snapshot,
+            crawl_started_at=crawl_started_at,
+            skipped_paths=self.last_crawl_skipped_paths,
+        )
 
     def _reconcile_persistent_cache(self):
         entries = self.state.list_entries()
@@ -955,7 +992,9 @@ class ICloudSyncEngine:
                 )
                 node = self._node_from_entry(entry)
                 with closing(node.open(stream=True)) as response:
-                    self.mirror.write_atomic_stream(path, response.raw, entry["mtime"])
+                    self.mirror.write_atomic_stream(
+                        path, response.raw, entry["mtime"], should_abort=self.stop_event.is_set
+                    )
             stats = self.mirror.stat_local(path)
             checksum = self.mirror.file_sha256(path)
             self.state.mark_hydrated(path, checksum, stats.st_size, int(stats.st_mtime))
@@ -970,10 +1009,18 @@ class ICloudSyncEngine:
         started_at = time.time()
         last_progress_log = started_at
         scanned_folders = 0
+        # Folders whose children are unknown this crawl.  Their absence from the
+        # snapshot says nothing about remote deletion, so the apply step must not
+        # prune under them.
+        self.last_crawl_skipped_paths = []
         _crawl_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="icloud-crawl")
         FOLDER_TIMEOUT = 60  # seconds per folder before giving up
 
         while queue:
+            if self.stop_event.is_set():
+                self.logger.info("Shutdown requested; abandoning remote metadata crawl")
+                self.last_crawl_skipped_paths = ["/"]
+                break
             node, path = queue.popleft()
             scanned_folders += 1
             try:
@@ -983,9 +1030,11 @@ class ICloudSyncEngine:
                 self.logger.warning(
                     "Timed out enumerating %s after %ss — skipping folder", path, FOLDER_TIMEOUT
                 )
+                self.last_crawl_skipped_paths.append(path)
                 continue
             except Exception as exc:
                 self.logger.error("Failed to enumerate %s: %s", path, exc)
+                self.last_crawl_skipped_paths.append(path)
                 continue
 
             for child in children:
@@ -1020,6 +1069,7 @@ class ICloudSyncEngine:
                 )
                 last_progress_log = now
 
+        _crawl_executor.shutdown(wait=False, cancel_futures=True)
         self.logger.info(
             "Remote metadata crawl complete: %s entries across %s folders in %.1fs",
             len(snapshot),
@@ -1028,8 +1078,9 @@ class ICloudSyncEngine:
         )
         return snapshot
 
-    def _apply_remote_snapshot(self, snapshot, crawl_started_at=None):
+    def _apply_remote_snapshot(self, snapshot, crawl_started_at=None, skipped_paths=()):
         remote_ids = set(snapshot.keys())
+        skipped_prefixes = [p.rstrip("/") + "/" for p in skipped_paths]
 
         for meta in snapshot.values():
             existing = self.state.get_entry_by_remote_id(meta["remote_drivewsid"])
@@ -1052,6 +1103,8 @@ class ICloudSyncEngine:
         for entry in self.state.list_entries():
             remote_id = entry["remote_drivewsid"]
             if not remote_id or remote_id in remote_ids:
+                continue
+            if any(entry["path"].startswith(prefix) for prefix in skipped_prefixes):
                 continue
             if entry["dirty"]:
                 self.logger.warning("Remote deleted dirty path %s; keeping local copy for upload", entry["path"])
@@ -1309,7 +1362,11 @@ class ICloudSyncEngine:
             self._log_sync("refresh-start", reason=reason)
             crawl_started_at = int(time.time())
             snapshot = self._crawl_remote_snapshot()
-            self._apply_remote_snapshot(snapshot, crawl_started_at=crawl_started_at)
+            self._apply_remote_snapshot(
+                snapshot,
+                crawl_started_at=crawl_started_at,
+                skipped_paths=self.last_crawl_skipped_paths,
+            )
             self._log_sync("refresh-complete", reason=reason)
         except Exception as exc:
             self.logger.error("Remote refresh failed (%s): %s", reason, exc)
@@ -1656,6 +1713,7 @@ class ICloudFS(Fuse):
             self.api = PyiCloudService(username, password,
                                        cookie_directory=cookie_dir,
                                        authenticate=False)
+            apply_default_timeout(self.api.session)
             if _partition:
                 self.api._setup_endpoint = (
                     f"https://p{_partition}-setup.icloud.com/setup/ws/1"

@@ -11,7 +11,7 @@ import threading
 import unittest
 from unittest.mock import Mock
 
-from driver import ICloudFS, ICloudSyncEngine, LocalMirror, SyncState
+from driver import ICLOUD_REQUEST_TIMEOUT, ICloudFS, ICloudSyncEngine, LocalMirror, SyncState, apply_default_timeout
 from pyicloud.exceptions import PyiCloudAPIResponseException, PyiCloudFailedLoginException
 
 
@@ -52,6 +52,17 @@ class DriverStateTests(unittest.TestCase):
         self.mirror.write_atomic_stream("/docs/a.txt", stream)
 
         self.assertEqual(self.mirror.read("/docs/a.txt", 100, 0), b"streamed content")
+
+    def test_write_atomic_stream_aborts_without_touching_destination(self):
+        self.mirror.write("/docs/a.txt", b"old", 0)
+
+        with self.assertRaises(InterruptedError):
+            self.mirror.write_atomic_stream(
+                "/docs/a.txt", NoUnboundedReadStream(b"new content"), should_abort=lambda: True
+            )
+
+        self.assertEqual(self.mirror.read("/docs/a.txt", 10, 0), b"old")
+        self.assertEqual(os.listdir(self.mirror.tmp_dir), [])
 
     def test_rename_tree_preserves_old_synced_paths_for_local_rename(self):
         self.state.upsert_entry(
@@ -384,6 +395,39 @@ class RemoteSnapshotRaceTests(unittest.TestCase):
         self.assertIsNone(self.state.get_entry("/old.txt"))
         self.assertFalse(self.mirror.exists("/old.txt"))
 
+    def test_snapshot_keeps_files_under_folder_that_failed_to_enumerate(self):
+        self._add_clean_remote_file("/Taxes/a.pdf", last_synced_at=100)
+        self._add_clean_remote_file("/Other/b.txt", last_synced_at=100)
+
+        self.engine._apply_remote_snapshot({}, crawl_started_at=200, skipped_paths=["/Taxes"])
+
+        self.assertTrue(self.mirror.exists("/Taxes/a.pdf"))
+        self.assertIsNotNone(self.state.get_entry("/Taxes/a.pdf"))
+        self.assertFalse(self.mirror.exists("/Other/b.txt"))
+
+    def test_crawl_records_failed_folder_as_skipped(self):
+        broken = Mock()
+        broken.name = "Taxes"
+        broken.data = {"type": "FOLDER", "drivewsid": "folder-taxes", "docwsid": "d", "etag": "e", "zone": "z"}
+        broken.get_children.side_effect = RuntimeError("cannot schedule new futures after shutdown")
+        root = Mock()
+        root.get_children.return_value = [broken]
+        self.engine.api.drive.root = root
+
+        snapshot = self.engine._crawl_remote_snapshot()
+
+        self.assertIn("folder-taxes", snapshot)
+        self.assertEqual(self.engine.last_crawl_skipped_paths, ["/Taxes"])
+
+    def test_crawl_abandoned_on_shutdown_protects_whole_tree(self):
+        self._add_clean_remote_file("/docs/a.txt", last_synced_at=100)
+        self.engine.stop_event.set()
+
+        self.engine.initial_scan()
+
+        self.assertEqual(self.engine.last_crawl_skipped_paths, ["/"])
+        self.assertTrue(self.mirror.exists("/docs/a.txt"))
+
 
 class PermissionCallbackTests(unittest.TestCase):
     def setUp(self):
@@ -715,6 +759,22 @@ class SyncEngineStartupTests(unittest.TestCase):
         self.assertEqual(upload_state["class_name"], "NamedFileStream")
         self.assertEqual(upload_state["name"], "a.txt")
         self.assertEqual(upload_state["prefix"], b"hello")
+
+
+class DefaultTimeoutTests(unittest.TestCase):
+    def test_fills_missing_timeout_and_keeps_explicit_one(self):
+        session = Mock()
+        request = session.request
+        request_raw = session.request_raw
+        apply_default_timeout(session)
+
+        session.request("GET", "https://example.invalid")
+        session.request("GET", "https://example.invalid", timeout=None)
+        session.request_raw("POST", "https://example.invalid", timeout=5)
+
+        self.assertEqual(request.call_args_list[0].kwargs["timeout"], ICLOUD_REQUEST_TIMEOUT)
+        self.assertEqual(request.call_args_list[1].kwargs["timeout"], ICLOUD_REQUEST_TIMEOUT)
+        self.assertEqual(request_raw.call_args.kwargs["timeout"], 5)
 
 
 class ICloudFSPathPolicyTests(unittest.TestCase):

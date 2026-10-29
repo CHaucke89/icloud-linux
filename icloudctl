@@ -60,6 +60,10 @@ write_service() {
   driver_py_q="$(systemd_quote_arg "$driver_py")"
   config_file_q="$(systemd_quote_arg "$CONFIG_FILE")"
   mount_dir_q="$(systemd_quote_arg "$mount_dir")"
+  # Only unmount when something is mounted; a bare fusermount on an idle
+  # mountpoint logs "entry not found in /etc/mtab" and shows as status=1/FAILURE.
+  # \$\$1 becomes $$1 in the unit, which systemd passes to sh as a literal $1.
+  local unmount_cmd="/bin/sh -c 'mountpoint -q \"\$\$1\" || exit 0; exec /usr/bin/fusermount -uz \"\$\$1\"' sh $mount_dir_q"
   cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=iCloud Linux FUSE filesystem (user)
@@ -68,14 +72,14 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStartPre=-/usr/bin/fusermount -uz $mount_dir_q
-ExecStop=-/usr/bin/fusermount -uz $mount_dir_q
+ExecStartPre=-$unmount_cmd
+ExecStop=-$unmount_cmd
 ExecStart=$python_bin_q $driver_py_q -f -c $config_file_q $mount_dir_q
 Restart=on-failure
 RestartSec=15
 TimeoutStopSec=10
 KillMode=control-group
-ExecStopPost=-/usr/bin/fusermount -uz $mount_dir_q
+ExecStopPost=-$unmount_cmd
 Environment=ICLOUD_LOG_PATH=%h/.local/state/icloud-linux/icloud.log
 
 [Install]
